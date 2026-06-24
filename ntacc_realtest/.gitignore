@@ -1,0 +1,2 @@
+# Compiled stats helper — rebuild with: cc -o nt_txstat nt_txstat.c -lntapi
+nt_txstat

@@ -1,0 +1,167 @@
+% Regression tests for scapy.contrib.ntacc.NtaccSocket
+#
+# These tests do NOT require a Napatech SmartNIC or libntapi: a fake NTAPI
+# library is injected so the pure-Python logic (fragment building, short-frame
+# padding, send accounting, caching, error handling, close) can run in CI.
+#
+# Type the following command to launch the tests:
+# $ test/run_tests -P "load_contrib('ntacc')" -t test/contrib/ntacc.uts
+
++ NtaccSocket (no hardware, fake NTAPI)
+
+= Load module and inject a fake libntapi
+
+import ctypes
+import scapy.contrib.ntacc as ntacc
+from scapy.contrib.ntacc import NtaccSocket, NtNetTxFragment_t, MIN_TX_FRAME_NO_FCS
+from scapy.error import Scapy_Exception
+# NB: UTScapy feeds blocks to an interactive interpreter, so no blank lines may
+# appear inside this class body (a blank line would terminate it early).
+class FakeLib:
+    def __init__(self):
+        self.tx_calls = []     # list of (port, [fragment sizes], timeout)
+        self.opened = []       # portMask passed to NT_NetTxOpen
+        self.closed = 0
+        self.fail_tx = False   # when True, NT_NetTxAddPacket returns an error
+    def NT_NetTxOpen(self, hptr, name, mask, numa, mhb):
+        self.opened.append(mask)
+        hptr._obj.value = 0xABCD   # non-NULL handle so close() runs NT_NetTxClose
+        return ntacc.NT_SUCCESS
+    def NT_NetTxAddPacket(self, hStream, port, frags, nfrags, timeout):
+        self.tx_calls.append((port, [frags[i].size for i in range(nfrags)], timeout))
+        return 1 if self.fail_tx else ntacc.NT_SUCCESS
+    def NT_NetTxClose(self, hStream):
+        self.closed += 1
+        return ntacc.NT_SUCCESS
+    def NT_ExplainError(self, status, buf, size):
+        buf.value = b"fake NTAPI error"
+        return None
+
+fake = FakeLib()
+ntacc._lib = fake          # _ntapi() now returns our fake and skips NT_Init
+ntacc._initialized = True
+assert NtaccSocket(port=0).lib is fake
+
+= NT_NetTxOpen receives the correct port mask
+
+fake.opened = []
+s = NtaccSocket(port=3)
+assert fake.opened == [1 << 3]
+s.close()
+
+= Normal-sized frame: single fragment, no padding
+
+fake.tx_calls = []
+s = NtaccSocket(port=0)
+pkt = Ether()/IP()/ICMP()/Raw(b"x" * 40)   # >= 60 bytes on the wire
+n = s.send(pkt)
+assert n == len(raw(pkt))
+assert len(fake.tx_calls) == 1
+port, sizes, timeout = fake.tx_calls[0]
+assert port == 0
+assert sizes == [len(raw(pkt))]            # exactly one fragment
+s.close()
+
+= Short frame: second zero-pad fragment is appended to reach the minimum
+
+fake.tx_calls = []
+s = NtaccSocket(port=0)
+short = Ether()                            # 14 bytes, well under the minimum
+slen = len(raw(short))
+assert slen < MIN_TX_FRAME_NO_FCS
+s.send(short)
+port, sizes, timeout = fake.tx_calls[0]
+assert len(sizes) == 2
+assert sizes[0] == slen
+assert sizes[1] == MIN_TX_FRAME_NO_FCS - slen
+assert sizes[0] + sizes[1] == MIN_TX_FRAME_NO_FCS
+s.close()
+
+= send() sets sent_time and returns the byte count
+
+s = NtaccSocket(port=0)
+pkt = Ether()/IP()/UDP()/Raw(b"payload-data-here")
+assert not hasattr(pkt, "sent_time") or pkt.sent_time is None
+n = s.send(pkt)
+assert n == len(raw(pkt))
+assert pkt.sent_time is not None
+s.close()
+
+= timeout is forwarded to NT_NetTxAddPacket
+
+fake.tx_calls = []
+s = NtaccSocket(port=0, timeout=1000)
+s.send(Ether()/IP()/UDP()/Raw(b"x" * 40))
+assert fake.tx_calls[0][2] == 1000
+s.close()
+
+= Caching: re-sending the same object reuses the prepared fragments
+
+s = NtaccSocket(port=0, cache=True)
+pkt = Ether()/IP()/ICMP()/Raw(b"y" * 40)
+s.send(pkt)
+prep1 = s._cache_prep
+s.send(pkt)
+assert s._cache_prep is prep1              # same object -> reused, not rebuilt
+s.send(Ether()/IP()/ICMP()/Raw(b"z" * 40))
+assert s._cache_prep is not prep1          # different object -> rebuilt
+s.close()
+
+= cache=False never stores a prepared entry
+
+s = NtaccSocket(port=0, cache=False)
+s.send(Ether()/IP()/ICMP()/Raw(b"y" * 40))
+assert s._cache_prep is None
+s.close()
+
+= A non-success NT_NetTxAddPacket status raises Scapy_Exception
+
+s = NtaccSocket(port=0)
+fake.fail_tx = True
+try:
+    s.send(Ether()/IP()/ICMP()/Raw(b"x" * 40))
+    assert False, "expected Scapy_Exception"
+except Scapy_Exception as e:
+    assert "NT_NetTxAddPacket" in str(e)
+    assert "fake NTAPI error" in str(e)
+
+fake.fail_tx = False
+s.close()
+
+= recv is not supported (transmit-only socket)
+
+s = NtaccSocket(port=0)
+try:
+    s.recv()
+    assert False, "recv should raise"
+except Scapy_Exception:
+    pass
+
+s.close()
+
+= recv_raw is not supported (transmit-only socket)
+
+s = NtaccSocket(port=0)
+try:
+    s.recv_raw()
+    assert False, "recv_raw should raise"
+except Scapy_Exception:
+    pass
+
+s.close()
+
+= fileno() returns -1
+
+s = NtaccSocket(port=0)
+assert s.fileno() == -1
+s.close()
+
+= close() calls NT_NetTxClose once and is idempotent
+
+before = fake.closed
+s = NtaccSocket(port=0)
+s.close()
+assert fake.closed == before + 1
+s.close()                                  # second close is a no-op
+assert fake.closed == before + 1
+assert s.closed is True
