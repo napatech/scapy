@@ -1,0 +1,51 @@
+# PWCW unit tests
+#
+# Type the following command to launch start the tests:
+# $ test/run_tests -P "load_contrib('pwcw')" -t test/contrib/pwcw.uts
+
++ PWCW
+
+= Load contrib
+
+load_contrib("pwcw")
+from scapy.contrib.pwcw import PWCW
+
+= Default control word is four zero bytes
+
+assert raw(PWCW()) == b'\x00\x00\x00\x00'
+
+= Field widths and packing (RFC 4385 preferred format)
+
+# zero=0, flags=0xf, frg=0b11, length=0x3f, seq=0xabcd
+s = raw(PWCW(flags=0xf, frg=3, length=0x3f, seq=0xabcd))
+assert s == b'\x0f\xff\xab\xcd'
+
+# leading nibble stays zero even with every other field maxed
+assert s[0] >> 4 == 0
+
+= Build & dissect round-trip
+
+p = PWCW(seq=42)
+q = PWCW(raw(p))
+assert q.zero == 0 and q.flags == 0 and q.frg == 0 and q.length == 0 and q.seq == 42
+
+= Dissect a fully-populated control word
+
+q = PWCW(b'\x0a\x96\x12\x34')
+assert q.zero == 0
+assert q.flags == 0xa
+assert q.frg == 0b10
+assert q.length == 0b010110
+assert q.seq == 0x1234
+
+= Payload is guessed as Ether when present
+
+p = PWCW()/Ether(src="00:01:02:03:04:05")/IP()
+p = PWCW(raw(p))
+assert Ether in p and IP in p
+assert p[Ether].src == "00:01:02:03:04:05"
+
+= Empty payload decodes as Padding, not Ether
+
+p = PWCW(raw(PWCW(seq=7)))
+assert not isinstance(p.payload, Ether)
